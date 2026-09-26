@@ -1,0 +1,620 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/rbs-audit: Audit RBS type signatures against Ruby runtime standard libraries
+#
+# Examples:
+#   bin/rbs-audit uri
+#   bin/rbs-audit base64 --strict
+#   bin/rbs-audit json -f markdown
+#   bin/rbs-audit --all
+#
+
+require "optparse"
+require "pathname"
+require "time"
+
+class RBSAuditor
+  attr_reader :library, :options, :out, :env, :builder, :library_decls, :core_type_names
+
+  def initialize(library, options = {}, out: $stdout)
+    @library = library
+    @options = options
+    @out = out
+  end
+
+  def run
+    setup_environment
+    ruby_modules = load_library_and_collect_modules
+
+    primary_modules, extended_modules = classify_modules(ruby_modules)
+
+    modules_to_inspect = primary_modules.to_a
+    modules_to_inspect += extended_modules.to_a if options[:include_extended]
+
+    report = {
+      library: library,
+      timestamp: Time.now.iso8601,
+      total_modules: modules_to_inspect.size,
+      gap_modules: 0,
+      modules: {}
+    }
+
+    primary_modules.sort.each do |mod_name|
+      mod_report = audit_primary_module(mod_name, ruby_modules[mod_name])
+      report[:gap_modules] += 1 if mod_report[:has_gaps]
+      if mod_report[:has_gaps] || options[:verbose]
+        report[:modules][mod_name] = mod_report
+      end
+    end
+
+    if options[:include_extended]
+      extended_modules.sort.each do |mod_name|
+        mod_report = audit_extended_module(mod_name, ruby_modules[mod_name])
+        report[:gap_modules] += 1 if mod_report[:has_gaps]
+        if mod_report[:has_gaps] || options[:verbose]
+          report[:modules][mod_name] = mod_report
+        end
+      end
+    end
+
+    render_report(report)
+    report[:gap_modules] == 0
+  end
+
+  private
+
+  def setup_environment
+    $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+    if options[:ruby_dir]
+      $LOAD_PATH.unshift File.join(options[:ruby_dir], "lib")
+    end
+
+    require "rbs"
+
+    loader = RBS::EnvironmentLoader.new(core_root: nil)
+    loader.add(path: Pathname("core"))
+
+    stdlib_path = Pathname("stdlib/#{library}/0")
+    if stdlib_path.exist?
+      manifest_file = stdlib_path / "manifest.yaml"
+      if manifest_file.exist?
+        require "yaml"
+        manifest = YAML.safe_load(manifest_file.read)
+        if manifest && (deps = manifest["dependencies"])
+          deps.each do |dep|
+            dep_name = dep["name"]
+            dep_path = Pathname("stdlib/#{dep_name}/0")
+            if dep_path.exist?
+              loader.add(path: dep_path)
+            else
+              loader.add(library: dep_name) rescue nil
+            end
+          end
+        end
+      end
+      loader.add(path: stdlib_path)
+    else
+      loader.add(library: library) rescue nil
+    end
+
+    @env = RBS::Environment.from_loader(loader).resolve_type_names
+    @builder = RBS::DefinitionBuilder.new(env: @env)
+
+    # Collect core type names
+    @core_type_names = Set.new
+    env.class_decls.each do |type_name, entry|
+      primary = entry.primary_decl rescue entry.each_decl.first
+      if primary&.location&.buffer&.name&.to_s&.include?("core/")
+        @core_type_names << type_name.to_s.sub(/^::/, "")
+      end
+    end
+
+    # Collect declarations originating from this stdlib
+    @library_decls = {}
+    target_substr = "stdlib/#{library}"
+
+    env.class_decls.each do |type_name, entry|
+      name = type_name.to_s.sub(/^::/, "")
+      all_decls = entry.each_decl.to_a
+      matching_decls = all_decls.select { |d| d.location&.buffer&.name&.to_s&.include?(target_substr) }
+      if matching_decls.any?
+        primary = entry.primary_decl rescue all_decls.first
+        @library_decls[name] = {
+          is_primary: primary&.location&.buffer&.name&.to_s&.include?(target_substr),
+          decls: matching_decls
+        }
+      end
+    end
+  end
+
+  def load_library_and_collect_modules
+    before_modules = ObjectSpace.each_object(Module).to_a
+
+    [library, library.tr("-", "/"), library.tr("-", "_")].uniq.each do |req_name|
+      begin
+        require req_name
+      rescue LoadError
+      end
+    end
+
+    if options[:ruby_dir]
+      lib_subdir = File.join(options[:ruby_dir], "lib", library)
+      if Dir.exist?(lib_subdir)
+        Dir.glob("#{lib_subdir}/**/*.rb").each do |file|
+          require file rescue nil
+        end
+      end
+    end
+
+    after_modules = ObjectSpace.each_object(Module).to_a
+    new_modules = after_modules - before_modules
+
+    result = {}
+    new_modules.each do |mod|
+      name = mod.name
+      next unless name
+      result[name] = mod
+    end
+
+    # Candidates for top-level namespace modules
+    candidates = Set.new
+    candidates << library.tr("-", "_").upcase
+    candidates << library.split(/[-_]/).map(&:capitalize).join
+    candidates << library.tr("-", "_").capitalize
+    candidates.merge(library_namespaces)
+    library_decls.each_key do |decl_name|
+      candidates << decl_name.split("::").first
+    end
+    candidates.select! { |c| c =~ /\A[A-Z]\w*\z/ }
+
+    candidates.each do |token|
+      begin
+        if Object.const_defined?(token, false)
+          val = Object.const_get(token)
+          if val.is_a?(Module)
+            collect_nested_modules(val, result)
+          end
+        end
+      rescue NameError
+      end
+    end
+
+    # Include modules declared in library RBS if available in Ruby runtime
+    library_decls.each_key do |name|
+      unless result.key?(name)
+        begin
+          const = Object.const_get(name)
+          result[name] = const if const.is_a?(Module)
+        rescue NameError
+        end
+      end
+    end
+
+    result
+  end
+
+  def collect_nested_modules(mod, result, visited = {})
+    return if visited[mod]
+    visited[mod] = true
+
+    name = mod.name
+    result[name] = mod if name
+
+    mod.constants(false).each do |c|
+      next if mod.autoload?(c)
+      val = mod.const_get(c) rescue next
+      if val.is_a?(Module)
+        collect_nested_modules(val, result, visited)
+      end
+    end
+  end
+
+  LIBRARY_NAMESPACE_MAP = {
+    "bigdecimal-math" => %w[BigMath],
+    "cgi-escape" => %w[CGI],
+    "did_you_mean" => %w[DidYouMean],
+    "io-console" => %w[IO],
+    "ipaddr" => %w[IPAddr],
+    "mutex_m" => %w[Mutex_m],
+    "net-http" => %w[Net],
+    "net-protocol" => %w[Net],
+    "net-smtp" => %w[Net],
+    "open-uri" => %w[OpenURI URI],
+    "pstore" => %w[PStore],
+    "random-formatter" => %w[Random],
+    "rdoc" => %w[RDoc],
+    "stringio" => %w[StringIO],
+    "strscan" => %w[StringScanner],
+    "tmpdir" => %w[Dir],
+    "tsort" => %w[TSort]
+  }.freeze
+
+  def library_namespaces
+    @library_namespaces ||= begin
+      ns = Set.new
+      if LIBRARY_NAMESPACE_MAP.key?(library)
+        ns.merge(LIBRARY_NAMESPACE_MAP[library])
+      else
+        ns << library.tr("-", "_").upcase
+        ns << library.split(/[-_]/).map(&:capitalize).join
+        ns << library.tr("-", "_").capitalize
+      end
+      ns.select! { |c| c =~ /\A[A-Z]\w*\z/ }
+      ns
+    end
+  end
+
+  def primary_module?(name)
+    root = name.split("::").first
+    library_namespaces.include?(root)
+  end
+
+  def classify_modules(ruby_modules)
+    primary = Set.new
+    extended = Set.new
+
+    library_decls.each_key do |name|
+      if primary_module?(name)
+        primary << name
+      else
+        extended << name
+      end
+    end
+
+    ruby_modules.each_key do |name|
+      if primary_module?(name)
+        primary << name
+      elsif library_decls.key?(name)
+        extended << name
+      end
+    end
+
+    [primary, extended]
+  end
+
+  def private_constant?(parent, const_name)
+    parent.const_defined?(const_name, false) && !parent.constants(false).include?(const_name.to_sym)
+  rescue
+    false
+  end
+
+  def audit_primary_module(name, ruby_mod)
+    type_name = RBS::TypeName.parse("::#{name}")
+    in_ruby = !ruby_mod.nil?
+    in_rbs = library_decls.key?(name) || env.class_decl?(type_name) || env.module_decl?(type_name) || env.class_alias_decls.key?(type_name)
+
+    res = {
+      name: name,
+      kind: :primary,
+      in_ruby: in_ruby,
+      in_rbs: in_rbs,
+      missing_singleton_methods: [],
+      missing_instance_methods: [],
+      missing_protected_methods: [],
+      missing_constants: [],
+      has_gaps: false
+    }
+
+    unless in_rbs
+      is_private = false
+      if in_ruby && name.include?("::")
+        parts = name.split("::")
+        base = parts.last
+        parent_name = parts[0...-1].join("::")
+        parent = Object.const_get(parent_name) rescue nil
+        if parent
+          is_private = private_constant?(parent, base)
+        end
+      end
+      res[:is_private] = is_private
+      res[:has_gaps] = !is_private unless options[:include_internal]
+      return res
+    end
+
+    unless in_ruby
+      res[:has_gaps] = true
+      return res
+    end
+
+    # 1. Singleton Methods
+    rbs_singleton_methods = begin
+      builder.build_singleton(type_name).methods.keys
+    rescue => _e
+      []
+    end
+    ruby_singleton_methods = ruby_mod.singleton_methods(false)
+    missing_singleton = ruby_singleton_methods.map(&:to_sym) - rbs_singleton_methods
+    missing_singleton.reject! { |m| internal_method?(m) } unless options[:include_internal]
+    res[:missing_singleton_methods] = missing_singleton.sort
+
+    # 2. Public Instance Methods
+    rbs_instance_methods = begin
+      builder.build_instance(type_name).methods.keys
+    rescue => _e
+      []
+    end
+    ruby_pub_instance = ruby_mod.public_instance_methods(false)
+    missing_instance = ruby_pub_instance.map(&:to_sym) - rbs_instance_methods
+    missing_instance.reject! { |m| internal_method?(m) } unless options[:include_internal]
+    res[:missing_instance_methods] = missing_instance.sort
+
+    # 3. Protected Instance Methods
+    ruby_prot_instance = ruby_mod.protected_instance_methods(false)
+    missing_prot = ruby_prot_instance.map(&:to_sym) - rbs_instance_methods
+    missing_prot.reject! { |m| internal_method?(m) } unless options[:include_internal]
+    res[:missing_protected_methods] = missing_prot.sort
+
+    # 4. Constants
+    ruby_constants = ruby_mod.constants(false).reject do |c|
+      begin
+        next true if !options[:include_internal] && private_constant?(ruby_mod, c)
+        val = ruby_mod.const_get(c)
+        val.is_a?(Module)
+      rescue
+        false
+      end
+    end
+    missing_const = []
+    ruby_constants.each do |c|
+      const_type_name = RBS::TypeName.parse("::#{name}::#{c}")
+      unless env.constant_decl?(const_type_name) || env.class_decl?(const_type_name) || env.module_decl?(const_type_name) || env.class_alias_decls.key?(const_type_name)
+        missing_const << c
+      end
+    end
+    missing_const.reject! { |c| internal_constant?(c) } unless options[:include_internal]
+    res[:missing_constants] = missing_const.sort
+
+    if res[:missing_singleton_methods].any? ||
+       res[:missing_instance_methods].any? ||
+       res[:missing_protected_methods].any? ||
+       res[:missing_constants].any?
+      res[:has_gaps] = true
+    end
+
+    res
+  end
+
+  def audit_extended_module(name, ruby_mod)
+    res = {
+      name: name,
+      kind: :extended,
+      in_ruby: !ruby_mod.nil?,
+      in_rbs: true,
+      missing_singleton_methods: [],
+      missing_instance_methods: [],
+      missing_protected_methods: [],
+      missing_constants: [],
+      has_gaps: false
+    }
+
+    return res unless ruby_mod
+
+    info = library_decls[name]
+    return res unless info
+
+    rbs_methods = []
+    info[:decls].each do |decl|
+      decl.members.each do |member|
+        if member.is_a?(RBS::AST::Members::MethodDefinition)
+          rbs_methods << [member.name, member.kind]
+        end
+      end
+    end
+
+    rbs_methods.each do |method_name, kind|
+      case kind
+      when :singleton
+        unless ruby_mod.respond_to?(method_name)
+          res[:missing_singleton_methods] << method_name
+        end
+      when :instance
+        unless ruby_mod.instance_methods.include?(method_name) || ruby_mod.private_instance_methods.include?(method_name)
+          res[:missing_instance_methods] << method_name
+        end
+      end
+    end
+
+    res[:has_gaps] = res[:missing_singleton_methods].any? || res[:missing_instance_methods].any?
+    res
+  end
+
+  def internal_method?(name)
+    name.to_s.start_with?("_")
+  end
+
+  def internal_constant?(name)
+    name.to_s.end_with?("_") || name.to_s.start_with?("_")
+  end
+
+  def render_report(report)
+    case options[:format]
+    when "markdown"
+      render_markdown(report)
+    when "json"
+      require "json"
+      out.puts JSON.pretty_generate(report)
+    else
+      render_text(report)
+    end
+  end
+
+  def render_text(report)
+    out.puts "================================================================================"
+    out.puts " RBS Audit Report: #{report[:library]}"
+    out.puts " Generated: #{report[:timestamp]}"
+    out.puts " Total Modules/Classes inspected: #{report[:total_modules]}"
+    out.puts " Modules with gaps: #{report[:gap_modules]}"
+    out.puts "================================================================================"
+
+    if report[:gap_modules] == 0 && !options[:verbose]
+      out.puts "\n🎉 No gaps detected! All inspected classes, methods, and constants are covered in RBS."
+      return
+    end
+
+    report[:modules].each do |mod_name, data|
+      out.puts "\n### #{mod_name}#{data[:kind] == :extended ? ' (Extended)' : ''}"
+      unless data[:has_gaps]
+        out.puts "  ✅ Fully covered"
+        next
+      end
+
+      unless data[:in_rbs]
+        out.puts "  ❌ Missing completely in RBS#{data[:is_private] ? ' (private_constant)' : ''}"
+        next
+      end
+      unless data[:in_ruby]
+        out.puts "  ⚠️ Defined in RBS, but not found in Ruby runtime"
+        next
+      end
+
+      if data[:missing_singleton_methods].any?
+        out.puts "  Missing Singleton Methods: #{data[:missing_singleton_methods].join(', ')}"
+      end
+      if data[:missing_instance_methods].any?
+        out.puts "  Missing Instance Methods:  #{data[:missing_instance_methods].join(', ')}"
+      end
+      if data[:missing_protected_methods].any?
+        out.puts "  Missing Protected Methods: #{data[:missing_protected_methods].join(', ')}"
+      end
+      if data[:missing_constants].any?
+        out.puts "  Missing Constants:         #{data[:missing_constants].join(', ')}"
+      end
+    end
+    out.puts "\n"
+  end
+
+  def render_markdown(report)
+    out.puts "# RBS Audit Report: `#{report[:library]}`"
+    out.puts ""
+    out.puts "- Inspected: #{report[:total_modules]} modules/classes"
+    out.puts "- Modules with gaps: #{report[:gap_modules]}"
+    out.puts ""
+
+    if report[:gap_modules] == 0 && !options[:verbose]
+      out.puts "🎉 **No gaps detected! All inspected classes, methods, and constants are covered in RBS.**"
+      return
+    end
+
+    out.puts "| Module / Class | Status | Details |"
+    out.puts "| :--- | :--- | :--- |"
+
+    report[:modules].each do |mod_name, data|
+      type_badge = data[:kind] == :extended ? " *(Extended)*" : ""
+      unless data[:has_gaps]
+        out.puts "| `#{mod_name}`#{type_badge} | ✅ Fully covered | - |"
+        next
+      end
+
+      unless data[:in_rbs]
+        out.puts "| `#{mod_name}`#{type_badge} | ❌ Missing in RBS | Whole class/module#{data[:is_private] ? ' (private_constant)' : ''} |"
+        next
+      end
+      unless data[:in_ruby]
+        out.puts "| `#{mod_name}`#{type_badge} | ⚠️ Missing in Ruby | Not in runtime |"
+        next
+      end
+
+      items = []
+      if data[:missing_singleton_methods].any?
+        items << "Singleton: `#{data[:missing_singleton_methods].join('`, `')}`"
+      end
+      if data[:missing_instance_methods].any?
+        items << "Instance: `#{data[:missing_instance_methods].join('`, `')}`"
+      end
+      if data[:missing_protected_methods].any?
+        items << "Protected: `#{data[:missing_protected_methods].join('`, `')}`"
+      end
+      if data[:missing_constants].any?
+        items << "Constants: `#{data[:missing_constants].join('`, `')}`"
+      end
+
+      out.puts "| `#{mod_name}`#{type_badge} | ⚠️ Incomplete | #{items.join('<br>')} |"
+    end
+  end
+end
+
+if __FILE__ == $0
+  options = {
+    format: "text",
+    include_internal: false,
+    include_extended: false,
+    verbose: false,
+    strict: false,
+    ruby_dir: nil,
+    all: false
+  }
+
+  OptionParser.new do |opts|
+    opts.banner = "Usage: bin/rbs-audit [options] [<library_name> ...]"
+
+    opts.on("-a", "--all", "Audit all standard libraries under stdlib/") do
+      options[:all] = true
+    end
+
+    opts.on("-f", "--format FORMAT", ["text", "markdown", "json"], "Output format (text, markdown, json)") do |f|
+      options[:format] = f
+    end
+
+    opts.on("--ruby-dir DIR", "Path to checked out ruby repository") do |d|
+      options[:ruby_dir] = d
+    end
+
+    opts.on("-i", "--[no-]include-internal", "Include internal methods/constants (_prefix or private_constant)") do |i|
+      options[:include_internal] = i
+    end
+
+    opts.on("-e", "--[no-]include-extended", "Include external modules extended by this library") do |e|
+      options[:include_extended] = e
+    end
+
+    opts.on("-s", "--strict", "Exit with non-zero status if any gaps are detected") do |s|
+      options[:strict] = s
+    end
+
+    opts.on("-v", "--verbose", "Show all inspected modules even if fully covered") do |v|
+      options[:verbose] = v
+    end
+
+    opts.on("-h", "--help", "Prints this help") do
+      puts opts
+      exit
+    end
+  end.parse!
+
+  libraries = if options[:all]
+                Dir.glob("stdlib/*").select { |d| File.directory?(d) }.map { |d| File.basename(d) }.sort
+              else
+                ARGV.dup
+              end
+
+  if libraries.empty?
+    abort "Error: library_name is required or use --all. Example: #{$0} uri"
+  end
+
+  if libraries.size > 1
+    require "open3"
+    all_success = true
+    sub_opts = []
+    sub_opts << "-f" << options[:format] if options[:format]
+    sub_opts << "--ruby-dir" << options[:ruby_dir] if options[:ruby_dir]
+    sub_opts << "-i" if options[:include_internal]
+    sub_opts << "-e" if options[:include_extended]
+    sub_opts << "-v" if options[:verbose]
+
+    libraries.each do |lib|
+      cmd = [RbConfig.ruby, $0, *sub_opts, lib]
+      stdout, stderr, status = Open3.capture3(*cmd)
+      print stdout
+      warn stderr unless stderr.empty? || stderr.include?("deprecated")
+      all_success = false unless status.success?
+    end
+
+    exit(options[:strict] && !all_success ? 1 : 0)
+  end
+
+  success = RBSAuditor.new(libraries.first, options).run
+  if options[:strict] && !success
+    exit 1
+  end
+end
